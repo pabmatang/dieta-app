@@ -15,7 +15,6 @@ from typing import Dict, Union , List, Optional, Tuple , Any
 import re
 from collections import defaultdict
 from pydantic import BaseModel, Field
-import openai
 from transformers import pipeline
 import requests
 import google.generativeai as genai
