@@ -61,7 +61,7 @@ def fetch_recipes_from_edamam(
     # Campos específicos a solicitar a Edamam para optimizar la respuesta
     # Ajusta según los campos que necesites para RecipeOption
     fields = ["uri", "label", "image", "source", "url", "yield", 
-              "ingredientLines", "calories", "totalTime", "mealType"]
+              "ingredientLines", "calories", "totalTime", "mealType", "totalNutrients"]
     params["field"] = fields
 
     # Edamam devuelve un número de 'hits' por página (por defecto 20).
