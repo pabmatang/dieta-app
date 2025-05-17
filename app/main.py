@@ -15,7 +15,6 @@ from typing import Dict, Union , List, Optional, Tuple , Any
 import re
 from collections import defaultdict
 from pydantic import BaseModel, Field
-from transformers import pipeline
 import requests
 import google.generativeai as genai
 import json
@@ -28,9 +27,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 app = FastAPI()
 Base.metadata.create_all(bind=database.engine)
-# Cargar el pipeline de Hugging Face para generación de texto (GPT-2, GPT-3, etc.)
-chatbot = pipeline("text-generation", model="gpt2")  # Puedes usar otros modelos, como GPT-3 si tienes acceso
-# Tu token de la API de Hugging Face
+
 
 
 # Configura tu clave API de Google
