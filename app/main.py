@@ -15,6 +15,8 @@ from typing import Dict, Union , List, Optional, Tuple , Any
 import re
 from collections import defaultdict
 from pydantic import BaseModel, Field
+import openai
+from transformers import pipeline
 import requests
 import google.generativeai as genai
 import json
@@ -27,7 +29,9 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 app = FastAPI()
 Base.metadata.create_all(bind=database.engine)
-
+# Cargar el pipeline de Hugging Face para generación de texto (GPT-2, GPT-3, etc.)
+chatbot = pipeline("text-generation", model="gpt2")  # Puedes usar otros modelos, como GPT-3 si tienes acceso
+# Tu token de la API de Hugging Face
 
 
 # Configura tu clave API de Google
@@ -114,6 +118,123 @@ def get_user_profile(current_user: User = Depends(auth.get_current_user)):
         "recetas_favoritas":current_user.recetas_favoritas
     }
     
+
+@app.get("/perfil/analisis-nutricional")
+async def get_analisis_nutricional_perfil(
+    current_user: User = Depends(auth.get_current_user)
+):
+    if not current_user.last_generated_menu_json:
+        raise HTTPException(status_code=404, detail="No hay menú guardado para analizar.")
+
+    try:
+        # last_generated_menu_json ALMACENA un objeto que tiene una CLAVE "menu"
+        # y el VALOR de esa clave es el diccionario de días y comidas.
+        # ej: {"menu": {"lunes": {"desayuno": {"selected": {...}, "options": [...]}}, ...}}
+        parsed_json_object = json.loads(current_user.last_generated_menu_json)
+        
+        # Verificamos que el JSON parseado es un diccionario y contiene la clave "menu"
+        if not isinstance(parsed_json_object, dict) or "menu" not in parsed_json_object:
+            print(f"Formato inesperado de last_generated_menu_json. Contenido: {current_user.last_generated_menu_json[:500]}...") # Log para depurar
+            raise HTTPException(status_code=500, detail="Formato de menú guardado no es el esperado. Falta la clave 'menu' principal.")
+
+        menu_items = parsed_json_object["menu"] # Este es el diccionario de días: {"lunes": ..., "martes": ...}
+        
+        # Verificamos que menu_items (el contenido de "menu") sea un diccionario
+        if not isinstance(menu_items, dict):
+            print(f"La clave 'menu' no contiene un diccionario de días. Contenido de 'menu': {menu_items}") # Log para depurar
+            raise HTTPException(status_code=500, detail="Formato de menú guardado incorrecto. La clave 'menu' debe ser un diccionario de días.")
+
+    except json.JSONDecodeError:
+        print(f"Error al decodificar JSON de last_generated_menu_json. Contenido: {current_user.last_generated_menu_json[:500]}...") # Log para depurar
+        raise HTTPException(status_code=500, detail="Error al leer el menú guardado (JSON malformado).")
+
+
+    analisis_diario = defaultdict(lambda: {
+        "totalCalorias": 0.0,
+        "macronutrientes": {
+            "proteinas_g": 0.0,
+            "grasas_g": 0.0,
+            "carbohidratos_g": 0.0
+        }
+    })
+
+    total_calorias_semana = 0.0
+    total_proteinas_semana = 0.0
+    total_grasas_semana = 0.0
+    total_carbohidratos_semana = 0.0
+    dias_con_datos_validos = 0 # Contador para días que realmente tienen datos de recetas procesables
+
+    for dia_nombre, comidas_del_dia in menu_items.items():
+        if not isinstance(comidas_del_dia, dict): continue
+
+        calorias_dia_actual = 0.0
+        proteinas_dia_actual = 0.0
+        grasas_dia_actual = 0.0
+        carbos_dia_actual = 0.0
+        dia_tuvo_recetas_procesadas = False
+
+        for tipo_comida, slot_comida in comidas_del_dia.items():
+            if not slot_comida or not isinstance(slot_comida, dict): continue
+
+            receta_seleccionada_data = None
+            if "selected" in slot_comida and isinstance(slot_comida["selected"], dict):
+                receta_seleccionada_data = slot_comida["selected"]
+            elif "options" in slot_comida and isinstance(slot_comida["options"], list) and len(slot_comida["options"]) > 0 and isinstance(slot_comida["options"][0], dict):
+                receta_seleccionada_data = slot_comida["options"][0]
+
+            if receta_seleccionada_data:
+                calorias = float(receta_seleccionada_data.get("calories", 0.0) or 0.0)
+                proteinas = float(receta_seleccionada_data.get("protein_g", 0.0) or 0.0)
+                grasas = float(receta_seleccionada_data.get("fat_g", 0.0) or 0.0)
+                carbos = float(receta_seleccionada_data.get("carbs_g", 0.0) or 0.0)
+
+                # Solo sumar si la receta tiene calorías (indicativo de datos válidos)
+                if calorias > 0 : # Podríamos ser más estrictos (ej. si faltan macros)
+                    calorias_dia_actual += calorias
+                    proteinas_dia_actual += proteinas
+                    grasas_dia_actual += grasas
+                    carbos_dia_actual += carbos
+                    dia_tuvo_recetas_procesadas = True
+        
+        if dia_tuvo_recetas_procesadas:
+            analisis_diario[dia_nombre]["totalCalorias"] = round(calorias_dia_actual, 2)
+            analisis_diario[dia_nombre]["macronutrientes"]["proteinas_g"] = round(proteinas_dia_actual, 2)
+            analisis_diario[dia_nombre]["macronutrientes"]["grasas_g"] = round(grasas_dia_actual, 2)
+            analisis_diario[dia_nombre]["macronutrientes"]["carbohidratos_g"] = round(carbos_dia_actual, 2)
+            
+            total_calorias_semana += calorias_dia_actual
+            total_proteinas_semana += proteinas_dia_actual
+            total_grasas_semana += grasas_dia_actual
+            total_carbohidratos_semana += carbos_dia_actual
+            dias_con_datos_validos += 1
+
+    promedio_calorias_dia = round(total_calorias_semana / dias_con_datos_validos, 2) if dias_con_datos_validos > 0 else 0.0
+    promedio_proteinas_dia = round(total_proteinas_semana / dias_con_datos_validos, 2) if dias_con_datos_validos > 0 else 0.0
+    promedio_grasas_dia = round(total_grasas_semana / dias_con_datos_validos, 2) if dias_con_datos_validos > 0 else 0.0
+    promedio_carbohidratos_dia = round(total_carbohidratos_semana / dias_con_datos_validos, 2) if dias_con_datos_validos > 0 else 0.0
+
+    # Filtrar días sin datos del análisis_diario para no enviar entradas vacías
+    analisis_diario_filtrado = {k: v for k, v in analisis_diario.items() if v["totalCalorias"] > 0 or \
+                               v["macronutrientes"]["proteinas_g"] > 0 or \
+                               v["macronutrientes"]["grasas_g"] > 0 or \
+                               v["macronutrientes"]["carbohidratos_g"] > 0}
+
+    return {
+        "analisisSemanal": {
+            "totalCalorias": round(total_calorias_semana, 2),
+            "promedioCaloriasDia": promedio_calorias_dia,
+            "diasConDatos": dias_con_datos_validos,
+            "macronutrientes": {
+                "total_proteinas_g": round(total_proteinas_semana, 2),
+                "promedio_proteinas_g_dia": promedio_proteinas_dia,
+                "total_grasas_g": round(total_grasas_semana, 2),
+                "promedio_grasas_g_dia": promedio_grasas_dia,
+                "total_carbohidratos_g": round(total_carbohidratos_semana, 2),
+                "promedio_carbohidratos_g_dia": promedio_carbohidratos_dia,
+            }
+        },
+        "analisisDiario": dict(analisis_diario_filtrado)
+    }
 
 @app.patch("/actualizar-perfil")
 def actualizar_parcial_perfil(
@@ -379,82 +500,114 @@ async def guardar_favorita(recipe: dict,db: Session = Depends(get_db), current_u
 
 @app.post("/eliminar-favorita")
 async def eliminar_favorita(recipe: dict,db: Session = Depends(get_db), current_user: User = Depends(auth.get_current_user)):
-    user = db.query(User).filter(User.id == current_user.id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    # 'current_user' es el usuario del token. Necesitamos 'db_user' para operaciones de BD.
+    db_user = db.query(User).filter(User.id == current_user.id).first()
+    if not db_user:
+        # Esto no debería ocurrir si el token es válido y el usuario existe.
+        raise HTTPException(status_code=404, detail="Usuario no encontrado en la base de datos")
 
-    try:
-        if not user.recetas_favoritas:
-            # Si no hay favoritas, inicializar como una lista JSON vacía
-            user.recetas_favoritas = json.dumps([])
-        elif isinstance(user.recetas_favoritas, str):
-            user.recetas_favoritas = json.loads(user.recetas_favoritas)
-        
-        # Asegurarse de que recetas_favoritas sea una lista después de cargar/parsear
-        if not isinstance(user.recetas_favoritas, list):
-            # Si por alguna razón no es una lista (ej. null de JSON, o mal formato), tratar como vacía
-            print(f"Advertencia: recetas_favoritas no era una lista después de cargar: {user.recetas_favoritas}")
-            user.recetas_favoritas = []
+    user_favorites_list = []
+    if db_user.recetas_favoritas: # Cargar desde el campo de la instancia de BD
+        try:
+            parsed_favorites = json.loads(db_user.recetas_favoritas)
+            if isinstance(parsed_favorites, list):
+                user_favorites_list = parsed_favorites
+            else:
+                print(f"Usuario: {current_user.username}. ADVERTENCIA: 'recetas_favoritas' no es una lista después de JSON.parse. Contenido: {parsed_favorites}")
+                user_favorites_list = [] 
+        except json.JSONDecodeError:
+            print(f"Usuario: {current_user.username}. Error al decodificar JSON de recetas_favoritas. Contenido: {db_user.recetas_favoritas}")
+            user_favorites_list = []
 
-        print("Recetas antes de eliminar:", user.recetas_favoritas)
-        print("Receta a eliminar (payload):", recipe)
-        
-        # Corregido: Comparar r.get("url") con recipe.get("recipe_url")
-        # recipe.get("recipe_url") contiene la URL enviada desde el frontend.
-        # Las recetas almacenadas en user.recetas_favoritas tienen su URL en la clave "url".
-        url_a_eliminar = recipe.get("recipe_url")
-        if url_a_eliminar:
-            recetas_actualizadas = [
-                r for r in user.recetas_favoritas if r.get("url") != url_a_eliminar
+    print(f"Usuario: {current_user.username}. Recetas favoritas ANTES de eliminar (cargadas de db_user.recetas_favoritas): {user_favorites_list}")
+
+    # El payload 'recipe' es un diccionario, esperamos que tenga 'recipe_url'
+    url_a_eliminar = recipe.get("recipe_url")
+    print(f"Usuario: {current_user.username}. Receta a eliminar (URL del payload): {url_a_eliminar}")
+
+    recetas_actualizadas_python_list = list(user_favorites_list) # Copiar para modificar
+
+    if url_a_eliminar:
+        original_count = len(user_favorites_list)
+        # Filtrar la lista usando la clave correcta "recipe_url"
+        # Y asegurarse que cada elemento 'r' es un diccionario antes de llamar a .get()
+        recetas_actualizadas_python_list = [
+            r for r in user_favorites_list 
+            if not (isinstance(r, dict) and r.get("recipe_url") == url_a_eliminar)
             ]
             
-            if len(recetas_actualizadas) < len(user.recetas_favoritas):
-                print(f"Receta con URL {url_a_eliminar} encontrada y eliminada.")
-            else:
-                print(f"Advertencia: No se encontró ninguna receta con URL {url_a_eliminar} para eliminar.")
-                print(f"URLs en lista: {[r.get('url') for r in user.recetas_favoritas]}")
-
-
-            user.recetas_favoritas = recetas_actualizadas
+        if len(recetas_actualizadas_python_list) < original_count:
+            print(f"Usuario: {current_user.username}. Receta con URL '{url_a_eliminar}' encontrada y eliminada de la lista local.")
         else:
-            print("Advertencia: No se proporcionó recipe_url en el payload para eliminar.")
+            print(f"Usuario: {current_user.username}. ADVERTENCIA: No se encontró ninguna receta con URL '{url_a_eliminar}' en la lista actual de favoritos para eliminar.")
+            current_urls_in_list = [fav.get('recipe_url') for fav in user_favorites_list if isinstance(fav, dict) and fav.get('recipe_url')]
+            print(f"Usuario: {current_user.username}. URLs actualmente en la lista de favoritos: {current_urls_in_list}")
 
-        user.recetas_favoritas = json.dumps(user.recetas_favoritas)
+        # Actualizar el campo de db_user con la nueva lista (convertida a JSON string)
+        print(f"[DEBUG] Usuario: {current_user.username}. Lista de favoritos (Python list) ANTES de json.dumps y guardar en db_user: {recetas_actualizadas_python_list}")
+        db_user.recetas_favoritas = json.dumps(recetas_actualizadas_python_list)
+        print(f"[DEBUG] Usuario: {current_user.username}. db_user.recetas_favoritas (JSON string) DESPUÉS de json.dumps, lista para guardar: {db_user.recetas_favoritas}")
+    
+    else:
+        print(f"Usuario: {current_user.username}. ADVERTENCIA: No se proporcionó recipe_url en el payload para eliminar. No se realizarán cambios en los favoritos.")
+        # Si no hay URL a eliminar, db_user.recetas_favoritas ya tiene el valor correcto (el original JSON string o el JSON string de la lista vacía si era None)
+        # Si db_user.recetas_favoritas era None y se inicializó user_favorites_list como [], 
+        # es bueno asegurarse que se guarda como '[]' en la DB.
+        if db_user.recetas_favoritas is None: # Si originalmente era None
+             db_user.recetas_favoritas = json.dumps([])
+
+
+    try:
+        db.add(db_user) # Asegura que la instancia db_user (con sus cambios) está en la sesión.
         db.commit()
-        print("Recetas después de eliminar y guardar:", user.recetas_favoritas)
-        return {"message": "Receta eliminada de favoritos correctamente."}
+        db.refresh(db_user) 
+        print(f"Usuario: {current_user.username}. Favoritos guardados correctamente en la DB. Contenido de db_user.recetas_favoritas después de commit: {db_user.recetas_favoritas}")
+        # El mensaje de retorno debe ser consistente con lo que espera el frontend.
+        # Si la receta no se encontró, el estado de la UI ya se actualizó optimisticamente.
+        # El backend simplemente procesó la solicitud.
+        return {"message": "Operación de eliminación de favoritos procesada."}
+
     except Exception as e:
-        db.rollback()  # Deshacer cualquier cambio en caso de error
-        print(f"Error al eliminar la receta favorita: {e}")  # Depuración del error
-        raise HTTPException(status_code=500, detail=f"Error al eliminar la receta favorita: {e}")
+        db.rollback() 
+        print(f"Usuario: {current_user.username}. Error al guardar en DB: {e}")
+        raise HTTPException(status_code=500, detail="Error al guardar cambios en la base de datos.")
+
+# Modelo Pydantic para el payload del request de menú recomendado
+class RecommendedMenuRequestPayload(BaseModel):
+    target_calories: Optional[int] = Field(None, gt=0) # Opcional, y si se provee, debe ser > 0
+    # Podrías añadir otros campos aquí si son necesarios en el futuro
+
 
 # Endpoint para generar menú semanal recomendado
 @app.post("/generar-menu-recomendado", response_model=WeeklyMenuWithOptionsResponse)
 async def generar_menu_recomendado_endpoint(
+    payload: RecommendedMenuRequestPayload, # Usar el nuevo modelo para el payload
     db: Session = Depends(get_db), 
-    current_user: User = Depends(auth.get_current_user)
+    current_user: User = Depends(auth.get_current_user) # Asegurar que es models.User
 ):
     try:
-        # Aquí llamaremos a una nueva función en menu_generator.py
-        # que tomará current_user para acceder a BMR, actividad, objetivo y favoritos
-        from app.services.menu_generator import generate_recommended_weekly_menu # Importación diferida
+        # La importación diferida puede quedarse o moverse al inicio del archivo si prefieres
+        # from app.services.menu_generator import generate_recommended_weekly_menu 
         
-        # Podríamos definir aquí los tipos de comida y ratios por defecto, 
-        # o permitir que el usuario los envíe si queremos más personalización en el futuro.
         default_meals = ["desayuno", "comida", "cena"]
         default_meal_ratios = {"desayuno": 0.30, "comida": 0.40, "cena": 0.30}
-        num_options_per_meal = 3 # Opciones por comida, igual que en MenuSemanal
+        num_options_per_meal = 3
+
+        print(f"Payload recibido en /generar-menu-recomendado: {payload}") # Log para ver qué llega
 
         menu_dict = generate_recommended_weekly_menu(
             user=current_user,
-            db_session=db, # Por si se necesita acceder a más datos del usuario o relacionados
+            db_session=db,
             meals_config=default_meals,
             ratios_config=default_meal_ratios,
-            num_options=num_options_per_meal
+            num_options=num_options_per_meal,
+            target_calories_override=payload.target_calories # Pasar las calorías del payload
         )
         return menu_dict
     except ValueError as ve:
+        print(f"ValueError en generar_menu_recomendado_endpoint: {ve}")
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         print(f"Error inesperado generando menú recomendado: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error interno del servidor al generar el menú recomendado.")
+
