@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional , List, Dict
+from typing import Optional , List, Dict, Any
 
 class UserCreate(BaseModel):
     username: str
@@ -45,6 +45,11 @@ class RecipeOption(BaseModel):
     url: str
     ingredients: List[str] = Field(description="Lista de líneas de ingredientes como strings")
     calories: float # Calorías por ración de la receta
+    protein_g: Optional[float] = None
+    fat_g: Optional[float] = None
+    carbs_g: Optional[float] = None
+    # Campo para almacenar el desglose completo de nutrientes de Edamam si es necesario
+    total_nutrients_raw: Optional[Dict[str, Any]] = Field(None, description="Raw totalNutrients object from Edamam for detailed breakdown") 
     # Puedes añadir más campos que Edamam provee y quieras usar en el frontend
     # مثلاً: totalTime: Optional[float] = None
     # مثلاً: yield_servings: Optional[float] = Field(None, alias="yield") # raciones
@@ -89,4 +94,6 @@ class FavoritaRequest(BaseModel):
     
 class FavoritasResponse(BaseModel):
     favoritas: List[dict]
+
+
 
